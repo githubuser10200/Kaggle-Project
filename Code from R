@@ -1,0 +1,594 @@
+#Read Files 
+holiday.events <- read.csv("downloads/holidays_events.csv")
+oil <- read.csv("downloads/oil.csv")
+stores <- read.csv("downloads/stores.csv")
+train <- read.csv("downloads/train.csv")
+transactions <- read.csv("downloads/transactions.csv")
+
+#Load Packages
+library(fpp2)
+library(scales)
+library(tidyverse) 
+library(tidyquant)
+library(gridExtra)
+library(tibbletime)
+library(forecast)
+library(itsmr)
+library(here)
+library(fpp2)
+library(tseries)
+library(dplyr)
+library(MASS)
+library(ggplot2)
+library(zoo)
+library(tidyverse)
+library(magrittr)
+library(Metrics)
+library(plotly)
+library(zeallot)
+library(lubridate)
+library(cowplot)
+library(forecast)
+library(ggpubr)
+library(gridExtra)
+library(lmerTest)
+library(nlme)
+library(tidyverse)
+library(rminer)
+library(tsibble)
+library(fable)
+library(base)
+
+#Cleaning
+train['date']<-as.Date(train$date, format='%Y-%m-%d')
+oil['date']<-as.Date(oil$date, format='%Y-%m-%d')
+transactions['date']<-as.Date(transactions$date, format='%Y-%m-%d')
+
+# calculate the median oil price of each month
+oil$year=year(oil$date)
+oil$month=month(oil$date)
+
+med_oil<-oil %>% group_by(year,month) %>%
+  summarise(median_oil_yr_mt=median(dcoilwtico,na.rm=TRUE))
+
+oil <- oil %>% left_join(med_oil, by=c('year','month')) %>% subset(select=-c(year,month))
+
+# calculate the median transaction of each month for each store 
+transactions$year=year(transactions$date)
+transactions$month=month(transactions$date)
+
+med_transactions<-transactions %>% group_by(store_nbr, year,month) %>%
+  summarise(median_transaction_yr_mt=median(transactions,na.rm=TRUE))
+
+transactions <- transactions %>% 
+  left_join(med_transactions, by=c('store_nbr','year','month')) %>% 
+  subset(select=-c(year,month))
+
+raw<-train %>% 
+  left_join(stores, by='store_nbr') %>%
+  left_join(oil,by='date') %>%
+  left_join(transactions,by=c('date','store_nbr')) 
+
+# set factor variables to chacter for table merging
+raw$state=as.character(raw$state)
+raw$city=as.character(raw$city)
+raw$family=as.character(raw$family)
+
+#set  variable
+df=raw
+
+# set back to factors
+df$state=as.factor(df$state)
+df$city=as.factor(df$city)
+df$family=as.factor(df$family)
+df$store_nbr=as.factor(df$store_nbr)
+df$cluster=as.factor(df$cluster)
+
+#set date related variables
+df['date']<-as.Date(df$date, format='%Y-%m-%d')
+
+df$year=year(df$date)
+df$month=month(df$date)
+df$mday=mday(df$date)
+df$wday=wday(df$date)
+df$myear <- format(as.Date(df$date), "%Y-%m")
+df$wyear=strftime(as.character(df$date), format = "%V")
+
+# cleanse outliers. set (+/-)1.5IQR boundary for outliers. 
+df_clean <- df %>% arrange("store_nbr", "family", "date")
+a=df_clean %>% group_by(store_nbr, family) %>%
+  summarise(min=min(sales, na.rm = TRUE), 
+            Q1=quantile(sales, probs = 0.25, na.rm = TRUE),
+            median=median(sales, na.rm = TRUE), 
+            Q3=quantile(sales, probs = 0.75, na.rm = TRUE),
+            max=max(sales, na.rm = TRUE),
+            iqr_h=Q3+1.5*IQR(sales, na.rm = TRUE),
+            iqr_l=ifelse(Q1-1.5*IQR(sales, na.rm = TRUE)<=0,0,Q1-1.5*IQR(sales, na.rm = TRUE))
+  ) %>%
+  ungroup()
+
+df_clean <- df_clean %>% left_join(a, by=c('store_nbr'='store_nbr', 
+                                           'family'='family'))
+
+df_clean <- df_clean %>% 
+  mutate(sales = ifelse(sales>iqr_h,NaN,sales))
+
+# special take_care of O's , implanted mean of weekly sales
+t<-df_clean %>% group_by(store_nbr,family,year,wyear) %>%
+  summarise(mean7=mean(sales, na.rm = TRUE))
+
+df_clean <- df_clean %>% left_join(t, by=c('store_nbr','family','year','wyear'))
+
+df_clean <- df_clean %>% 
+  mutate(sales = ifelse(mean7<0.0001 | is.na(mean7),iqr_l,sales))
+
+mean_transactions=mean(df_clean$transactions, na.rm = TRUE)
+mean_dcoilwtico=mean(df_clean$dcoilwtico, na.rm = TRUE)
+
+t<-df_clean %>% group_by(store_nbr,family,year,month) %>%
+  summarise(median_yr_mt=median(sales, na.rm=TRUE))
+
+df_clean <- df_clean %>% left_join(t, by=c('store_nbr','family','year','month'))
+
+# data cleansing on oil price(dcoilwtico) and transactions
+df_clean <- df_clean %>% 
+  mutate(sales = ifelse(is.na(sales)==TRUE,median_yr_mt,sales),         
+         transactions = ifelse(is.na(transactions)==TRUE | transactions==0,
+                               ifelse(is.na(median_transaction_yr_mt)==T | median_transaction_yr_mt==0, 
+                                      mean_transactions,
+                                      median_transaction_yr_mt) , transactions),
+         dcoilwtico = ifelse(is.na(dcoilwtico)==TRUE | dcoilwtico==0,
+                             ifelse(is.na(median_oil_yr_mt)==T | median_oil_yr_mt==0, 
+                                    mean_dcoilwtico,
+                                    median_oil_yr_mt) , dcoilwtico)
+  )
+  
+  
+#Creating subsets and TBATS models subset for Store Numbers 
+df_sorted <- df_clean
+
+subset <- subset(df_sorted, store_nbr == 1)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data2 <- data %>% select(sales)
+series1 <- ts(data2,start=c(1))
+ETS1 <- forecast(tbats(series1), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 2)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series2 <- ts(data3,start=c(1))
+ETS2 <- forecast(tbats(series2), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 3)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series3 <- ts(data3,start=c(1))
+ETS3 <- forecast(tbats(series3), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 4)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series4 <- ts(data3,start=c(1))
+ETS4 <- forecast(tbats(series4), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 5)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series5 <- ts(data3,start=c(1))
+ETS5 <- forecast(tbats(series5), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 6)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series6 <- ts(data3,start=c(1))
+ETS6 <- forecast(tbats(series6), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 7)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series7 <- ts(data3,start=c(1))
+ETS7 <- forecast(tbats(series7), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 8)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series8 <- ts(data3,start=c(1))
+ETS8 <- forecast(tbats(series8), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 9)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series9 <- ts(data3,start=c(1))
+ETS9 <- forecast(tbats(series9), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 10)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series10 <- ts(data3,start=c(1))
+ETS10 <- forecast(tbats(series10), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 11)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series11 <- ts(data3,start=c(1))
+ETS11 <- forecast(tbats(series11), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 12)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series12 <- ts(data3,start=c(1))
+ETS12 <- forecast(tbats(series12), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 13)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series13 <- ts(data3,start=c(1))
+ETS13 <- forecast(tbats(series13), h=15) %>% as.data.frame()
+
+
+subset <- subset(df_sorted, store_nbr == 14)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series14 <- ts(data3,start=c(1))
+ETS14 <- forecast(tbats(series14), h=15) %>% as.data.frame()
+
+
+subset <- subset(df_sorted, store_nbr == 15)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series15 <- ts(data3,start=c(1))
+ETS15 <- forecast(tbats(series15), h=15) %>% as.data.frame()
+
+
+subset <- subset(df_sorted, store_nbr == 16)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series16 <- ts(data3,start=c(1))
+ETS16 <- forecast(tbats(series16), h=15) %>% as.data.frame()
+
+
+subset <- subset(df_sorted, store_nbr == 17)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series17 <- ts(data3,start=c(1))
+ETS17 <- forecast(tbats(series17), h=15) %>% as.data.frame()
+
+
+subset <- subset(df_sorted, store_nbr == 18)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)series16 <- ts(data3,start=c(1))
+series18 <- ts(data3,start=c(1))
+ETS18 <- forecast(tbats(series18), h=15) %>% as.data.frame()
+
+
+subset <- subset(df_sorted, store_nbr == 19)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series19 <- ts(data3,start=c(1))
+ETS19 <- forecast(tbats(series19), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 20)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series20 <- ts(data3,start=c(1))
+ETS20 <- forecast(tbats(series20), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 21)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series21 <- ts(data3,start=c(1))
+ETS21 <- forecast(tbats(series21), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 22)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series22 <- ts(data3,start=c(1))
+ETS22 <- forecast(tbats(series22), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 23)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series23 <- ts(data3,start=c(1))
+ETS23 <- forecast(tbats(series23), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 24)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series24 <- ts(data3,start=c(1))
+ETS24 <- forecast(tbats(series24), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 25)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series25 <- ts(data3,start=c(1))
+ETS25 <- forecast(tbats(series25), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 26)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series26 <- ts(data3,start=c(1))
+ETS26 <- forecast(tbats(series26), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 27)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series27 <- ts(data3,start=c(1))
+ETS27 <- forecast(tbats(series27), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 28)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series28 <- ts(data3,start=c(1))
+ETS28 <- forecast(tbats(series28), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 29)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series29 <- ts(data3,start=c(1))
+ETS29 <- forecast(tbats(series29), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 30)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series30 <- ts(data3,start=c(1))
+ETS30 <- forecast(tbats(series30), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 31)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series31 <- ts(data3,start=c(1))
+ETS31 <- forecast(tbats(series31), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 32)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series32 <- ts(data3,start=c(1))
+ETS32 <- forecast(tbats(series32), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 33)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series33 <- ts(data3,start=c(1))
+ETS33 <- forecast(tbats(series33), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 34)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series34 <- ts(data3,start=c(1))
+ETS34 <- forecast(tbats(series34), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 35)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series35 <- ts(data3,start=c(1))
+ETS35 <- forecast(tbats(series35), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 36)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series36 <- ts(data3,start=c(1))
+ETS36 <- forecast(tbats(series36), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 37)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series37 <- ts(data3,start=c(1))
+ETS37 <- forecast(tbats(series37), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 38)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series38 <- ts(data3,start=c(1))
+ETS38 <- forecast(tbats(series38), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 39)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series39 <- ts(data3,start=c(1))
+ETS39 <- forecast(tbats(series39), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 40)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series40 <- ts(data3,start=c(1))
+ETS40 <- forecast(tbats(series40), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 41)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series41 <- ts(data3,start=c(1))
+ETS41 <- forecast(tbats(series41), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 42)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series42 <- ts(data3,start=c(1))
+ETS42 <- forecast(tbats(series42), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 43)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series43 <- ts(data3,start=c(1))
+ETS43 <- forecast(tbats(series43), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 44)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series44 <- ts(data3,start=c(1))
+ETS44 <- forecast(tbats(series44), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 45)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series45 <- ts(data3,start=c(1))
+ETS45 <- forecast(tbats(series45), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 46)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series46 <- ts(data3,start=c(1))
+ETS46 <- forecast(tbats(series46), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 47)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series47 <- ts(data3,start=c(1))
+ETS47 <- forecast(tbats(series47), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 48)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series48 <- ts(data3,start=c(1))
+ETS48 <- forecast(tbats(series48), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 49)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series49 <- ts(data3,start=c(1))
+ETS49 <- forecast(tbats(series49), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 50)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series50 <- ts(data3,start=c(1))
+ETS50 <- forecast(tbats(series50), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 51)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series51 <- ts(data3,start=c(1))
+ETS51 <- forecast(tbats(series51), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 52)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series52 <- ts(data3,start=c(1))
+ETS52 <- forecast(tbats(series52), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 53)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series53 <- ts(data3,start=c(1))
+ETS53 <- forecast(tbats(series53), h=15) %>% as.data.frame()
+
+subset <- subset(df_sorted, store_nbr == 54)
+subset_1 <- subset %>% select(date, sales)
+data <- subset_1 %>% group_by(date) %>% summarise_at(vars(sales),funs(mean(.,na.rm=TRUE)))
+data3 <- data %>% select(sales)
+series54 <- ts(data3,start=c(1))
+ETS54 <- forecast(tbats(series54), h=15) %>% as.data.frame()
+
+
+#Combine forecasts for each subset into a single dataset
+predictions <- cbind(ETS1$`Point Forecast`, 
+                     ETS2$`Point Forecast`, 
+                     ETS3$`Point Forecast`, 
+                     ETS4$`Point Forecast`, 
+                     ETS5$`Point Forecast`, 
+                     ETS6$`Point Forecast`, 
+                     ETS7$`Point Forecast`, 
+                     ETS8$`Point Forecast`, 
+                     ETS9$`Point Forecast`, 
+                     ETS10$`Point Forecast`, 
+                     ETS11$`Point Forecast`, 
+                     ETS12$`Point Forecast`, 
+                     ETS13$`Point Forecast`, 
+                     ETS14$`Point Forecast`, 
+                     ETS15$`Point Forecast`, 
+                     ETS16$`Point Forecast`, 
+                     ETS17$`Point Forecast`, 
+                     ETS18$`Point Forecast`, 
+                     ETS19$`Point Forecast`, 
+                     ETS20$`Point Forecast`, 
+                     ETS21$`Point Forecast`, 
+                     ETS22$`Point Forecast`, 
+                     ETS23$`Point Forecast`, 
+                     ETS24$`Point Forecast`, 
+                     ETS25$`Point Forecast`, 
+                     ETS26$`Point Forecast`, 
+                     ETS27$`Point Forecast`, 
+                     ETS28$`Point Forecast`, 
+                     ETS29$`Point Forecast`, 
+                     ETS30$`Point Forecast`, 
+                     ETS31$`Point Forecast`, 
+                     ETS32$`Point Forecast`, 
+                     ETS33$`Point Forecast`,
+                     ETS34$`Point Forecast`, 
+                     ETS35$`Point Forecast`, 
+                     ETS36$`Point Forecast`, 
+                     ETS37$`Point Forecast`, 
+                     ETS38$`Point Forecast`, 
+                     ETS39$`Point Forecast`, 
+                     ETS40$`Point Forecast`, 
+                     ETS41$`Point Forecast`, 
+                     ETS42$`Point Forecast`, 
+                     ETS43$`Point Forecast`, 
+                     ETS44$`Point Forecast`, 
+                     ETS45$`Point Forecast`, 
+                     ETS46$`Point Forecast`, 
+                     ETS47$`Point Forecast`, 
+                     ETS48$`Point Forecast`, 
+                     ETS49$`Point Forecast`, 
+                     ETS50$`Point Forecast`, 
+                     ETS51$`Point Forecast`, 
+                     ETS52$`Point Forecast`, 
+                     ETS53$`Point Forecast`, 
+                     ETS54$`Point Forecast`) 
+
+#Calculate mean sales for each subset
+means <- rowMeans(predictions) %>% as.data.frame()
+submission <- means %>% rename(sales = ".")
+submission
